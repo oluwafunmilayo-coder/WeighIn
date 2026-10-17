@@ -19,7 +19,11 @@ import { renderComment } from "./comment";
 import { buildForRevision, parseOptionalBooleanInput } from "./build-selection";
 import { writeReportFile, generateFailureReport } from "./report";
 import { buildPrMetadata } from "./pr-metadata";
-import { redactEndpointSecrets, sanitizeEndpoint } from "./endpoint";
+import {
+  parseJsonRpcResponse,
+  redactEndpointSecrets,
+  sanitizeEndpoint,
+} from "./endpoint";
 
 // The configured endpoint is tracked only so the terminal failure path can
 // redact any credential it may contain before reporting.
@@ -46,11 +50,13 @@ async function assertRpcHealthy(rpcUrl: string): Promise<void> {
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} ${res.statusText}`);
     }
-    const json = (await res.json()) as any;
-    if (json.error) {
-      throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
+    const health = parseJsonRpcResponse(await res.text(), 1);
+    if ("error" in health) {
+      throw new Error(
+        `RPC getHealth method error: ${JSON.stringify(health.error)}`,
+      );
     }
-    if (json.result?.status !== "healthy")
+    if ((health.result as any)?.status !== "healthy")
       throw new Error("RPC has not reported healthy");
     const network = await fetch(rpcUrl, {
       method: "POST",
@@ -60,15 +66,20 @@ async function assertRpcHealthy(rpcUrl: string): Promise<void> {
     });
     if (!network.ok)
       throw new Error(`HTTP ${network.status} ${network.statusText}`);
-    const metadata = (await network.json()) as any;
+    const metadata = parseJsonRpcResponse(await network.text(), 2);
+    if ("error" in metadata) {
+      throw new Error(
+        `RPC getNetwork method error: ${JSON.stringify(metadata.error)}`,
+      );
+    }
+    const networkResult = metadata.result as { passphrase?: unknown } | null;
     if (
-      metadata.error ||
-      typeof metadata.result?.passphrase !== "string" ||
-      !metadata.result.passphrase.trim()
+      typeof networkResult?.passphrase !== "string" ||
+      !networkResult.passphrase.trim()
     ) {
       throw new Error("Invalid RPC network metadata");
     }
-    core.info(`RPC healthy — network: ${metadata.result.passphrase}`);
+    core.info(`RPC healthy — network: ${networkResult.passphrase}`);
   } catch (err: any) {
     core.setFailed(
       `Soroban RPC at ${sanitizeEndpoint(rpcUrl)} is not reachable: ${redactEndpointSecrets(String(err?.message ?? err), rpcUrl)}\n` +

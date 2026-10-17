@@ -52969,6 +52969,51 @@ var RpcServer = class {
 // src/endpoint.ts
 var REDACTED_VALUE = "REDACTED";
 var INVALID_ENDPOINT = "[invalid endpoint]";
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function parseJsonRpcResponse(rawBody, expectedId) {
+  let value;
+  try {
+    value = JSON.parse(rawBody);
+  } catch {
+    throw new Error("Malformed JSON-RPC response: invalid JSON");
+  }
+  if (!isRecord(value)) {
+    throw new Error("Malformed JSON-RPC response: expected an object");
+  }
+  if (value.jsonrpc !== "2.0") {
+    throw new Error("Malformed JSON-RPC response: unsupported jsonrpc version");
+  }
+  if (!Object.hasOwn(value, "id") || value.id !== expectedId) {
+    throw new Error(
+      "Malformed JSON-RPC response: response ID does not match request"
+    );
+  }
+  const hasResult = Object.hasOwn(value, "result");
+  const hasError = Object.hasOwn(value, "error");
+  if (hasResult === hasError) {
+    throw new Error(
+      "Malformed JSON-RPC response: expected exactly one of result or error"
+    );
+  }
+  const allowedKeys = /* @__PURE__ */ new Set([
+    "jsonrpc",
+    "id",
+    hasResult ? "result" : "error"
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    throw new Error("Malformed JSON-RPC response: unexpected envelope field");
+  }
+  if (hasResult) {
+    return value;
+  }
+  const error2 = value.error;
+  if (!isRecord(error2) || !Number.isInteger(error2.code) || typeof error2.message !== "string" || Object.keys(error2).some((key) => !["code", "message", "data"].includes(key))) {
+    throw new Error("Malformed JSON-RPC response: invalid error object");
+  }
+  return value;
+}
 function sanitizeEndpoint(rawUrl) {
   let url;
   try {
@@ -53043,6 +53088,7 @@ async function ensureAccountReady(rpcUrl, publicKey, signal) {
   ).toXDR("base64");
   const deadline = Date.now() + DEADLINE_MS;
   let funded = false, lastError = "account has not appeared in RPC";
+  let requestId = 0;
   async function request3(url, options = {}) {
     try {
       if (signal?.aborted)
@@ -53082,23 +53128,32 @@ async function ensureAccountReady(rpcUrl, publicKey, signal) {
     if (signal?.aborted)
       throw signal.reason || new Error("Account readiness cancelled");
     try {
+      const id = ++requestId;
       const response = await request3(rpcUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           jsonrpc: "2.0",
-          id: 1,
+          id,
           method: "getLedgerEntries",
           params: { keys: [key] }
         })
       });
-      const json = JSON.parse(response);
-      if (json.error)
+      let json;
+      try {
+        json = parseJsonRpcResponse(response, id);
+      } catch (error2) {
         throw new Error(
-          `Account readiness RPC error at ${sanitizeEndpoint(rpcUrl)}: ${redactEndpointSecrets(JSON.stringify(json.error), rpcUrl)}`
+          `Account readiness invalid RPC response at ${sanitizeEndpoint(rpcUrl)}: ${redactEndpointSecrets(String(error2?.message ?? error2), rpcUrl)}`
         );
-      const entries = json.result?.entries;
-      if (!Number.isInteger(json.result?.latestLedger) || json.result.latestLedger <= 0 || !Array.isArray(entries) || entries.length > 1)
+      }
+      if ("error" in json)
+        throw new Error(
+          `Account readiness RPC method error at ${sanitizeEndpoint(rpcUrl)}: ${redactEndpointSecrets(JSON.stringify(json.error), rpcUrl)}`
+        );
+      const result = json.result;
+      const entries = result?.entries;
+      if (!Number.isInteger(result?.latestLedger) || result.latestLedger <= 0 || !Array.isArray(entries) || entries.length > 1)
         throw new Error("Invalid account readiness RPC response");
       if (entries.length === 1) {
         const entry = entries[0];
@@ -53483,6 +53538,7 @@ var RpcError = class extends Error {
     this.rpcError = rpcError;
   }
 };
+var nextRpcRequestId = 0;
 function isTransientLedgerRead(failure) {
   if (!(failure instanceof RpcError) || failure.method !== "getLedgerEntries")
     return false;
@@ -53496,11 +53552,17 @@ async function callRpc(rpcUrl, method, params, signal) {
   let response;
   const timeoutSignal = AbortSignal.timeout(3e4);
   const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  const requestId = ++nextRpcRequestId;
   try {
     response = await fetch(rpcUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: requestId,
+        method,
+        params
+      }),
       signal: combinedSignal
     });
   } catch (error2) {
@@ -53515,10 +53577,29 @@ async function callRpc(rpcUrl, method, params, signal) {
     throw new Error(
       `RPC ${method}: HTTP ${response.status} at ${sanitizeEndpoint(rpcUrl)}`
     );
-  const body = await response.json();
-  if (body.error || body.result === void 0)
-    throw new RpcError(method, body.error, rpcUrl);
-  return body.result;
+  let responseBody;
+  try {
+    responseBody = await response.text();
+  } catch (error2) {
+    if (signal?.aborted) {
+      throw signal.reason || new Error(`RPC ${method} cancelled`);
+    }
+    throw new Error(
+      `RPC ${method} response transport failure at ${sanitizeEndpoint(rpcUrl)}: ${redactEndpointSecrets(String(error2?.message ?? error2), rpcUrl)}`
+    );
+  }
+  let envelope;
+  try {
+    envelope = parseJsonRpcResponse(responseBody, requestId);
+  } catch (error2) {
+    throw new Error(
+      `RPC ${method} invalid response at ${sanitizeEndpoint(rpcUrl)}: ${redactEndpointSecrets(String(error2?.message ?? error2), rpcUrl)}`
+    );
+  }
+  if ("error" in envelope) {
+    throw new RpcError(method, envelope.error, rpcUrl);
+  }
+  return envelope.result;
 }
 async function measureInvocation(rpcUrl, transaction, helperPath, options) {
   const signal = options?.signal;
@@ -54993,11 +55074,13 @@ async function assertRpcHealthy(rpcUrl) {
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} ${res.statusText}`);
     }
-    const json = await res.json();
-    if (json.error) {
-      throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
+    const health = parseJsonRpcResponse(await res.text(), 1);
+    if ("error" in health) {
+      throw new Error(
+        `RPC getHealth method error: ${JSON.stringify(health.error)}`
+      );
     }
-    if (json.result?.status !== "healthy")
+    if (health.result?.status !== "healthy")
       throw new Error("RPC has not reported healthy");
     const network = await fetch(rpcUrl, {
       method: "POST",
@@ -55007,11 +55090,17 @@ async function assertRpcHealthy(rpcUrl) {
     });
     if (!network.ok)
       throw new Error(`HTTP ${network.status} ${network.statusText}`);
-    const metadata = await network.json();
-    if (metadata.error || typeof metadata.result?.passphrase !== "string" || !metadata.result.passphrase.trim()) {
+    const metadata = parseJsonRpcResponse(await network.text(), 2);
+    if ("error" in metadata) {
+      throw new Error(
+        `RPC getNetwork method error: ${JSON.stringify(metadata.error)}`
+      );
+    }
+    const networkResult = metadata.result;
+    if (typeof networkResult?.passphrase !== "string" || !networkResult.passphrase.trim()) {
       throw new Error("Invalid RPC network metadata");
     }
-    core3.info(`RPC healthy \u2014 network: ${metadata.result.passphrase}`);
+    core3.info(`RPC healthy \u2014 network: ${networkResult.passphrase}`);
   } catch (err) {
     core3.setFailed(
       `Soroban RPC at ${sanitizeEndpoint(rpcUrl)} is not reachable: ${redactEndpointSecrets(String(err?.message ?? err), rpcUrl)}

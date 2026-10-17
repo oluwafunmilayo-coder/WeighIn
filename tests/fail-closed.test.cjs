@@ -202,6 +202,7 @@ function action(mode, config = policy, tmpRoot = null, reportPath = null) {
 }
 for (const [mode, message] of [
   ["funding-exhausted", /Account readiness failed within 120s/],
+  ["rpc-invalid-envelope", /response ID does not match request/],
   ["rpc-unhealthy", /RPC has not reported healthy/],
   ["checkout", /unit checkout failure/],
   ["worktree", /unit worktree failure/],
@@ -225,6 +226,12 @@ for (const [mode, message] of [
     assert.match(result.summary, message);
     assert.match(result.summary, /No passing comparison/);
   });
+test("Action rejects a mismatched health response before account readiness or builds", () => {
+  const result = action("rpc-invalid-envelope");
+  assert.equal(result.status, 1);
+  assert.match(result.summary, /response ID does not match request/);
+  assert.equal(result.keyPaths.length, 0);
+});
 for (const config of [
   "not valid toml = ",
   '[thresholds.functions.hello]\ncpu_instructions="typo"',

@@ -24,20 +24,27 @@ function logKeyPath(filePath) {
   );
 }
 globalThis.fetch = async (url, options) => {
-  const method = options?.body ? JSON.parse(options.body).method : "";
+  const request = options?.body ? JSON.parse(options.body) : null;
+  const method = request?.method ?? "";
   if (mode === "funding-exhausted") {
     if (!method) return new Response("still warming", { status: 502 });
     if (method === "getLedgerEntries")
       return new Response(
-        JSON.stringify({ result: { entries: [], latestLedger: 100 } }),
+        JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { entries: [], latestLedger: 100 } }),
       );
+  }
+  const result = {
+    passphrase: "unit-test-network",
+    status: mode === "rpc-unhealthy" ? "starting" : "healthy",
+  };
+  if (mode === "rpc-invalid-envelope" && method === "getHealth") {
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id + 1, result }));
   }
   return new Response(
     JSON.stringify({
-      result: {
-        passphrase: "unit-test-network",
-        status: mode === "rpc-unhealthy" ? "starting" : "healthy",
-      },
+      jsonrpc: "2.0",
+      id: request?.id,
+      result,
     }),
   );
 };
