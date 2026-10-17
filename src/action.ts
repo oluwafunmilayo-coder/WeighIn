@@ -79,6 +79,64 @@ async function assertRpcHealthy(rpcUrl: string): Promise<void> {
   }
 }
 
+function isPathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === "" ||
+    (relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative))
+  );
+}
+
+/** Resolve fixture inputs only when the lexical and real paths stay in a revision. */
+function resolveRevisionFixturesPath(
+  worktreeRoot: string,
+  fixturesPathInput: string,
+  revision: "HEAD" | "BASE",
+): string {
+  const invalidPathMessage = `fixtures-path for ${revision} must be a relative path inside the ${revision} worktree`;
+  if (
+    !fixturesPathInput.trim() ||
+    path.isAbsolute(fixturesPathInput) ||
+    path.win32.isAbsolute(fixturesPathInput) ||
+    /^[A-Za-z]:/.test(fixturesPathInput)
+  ) {
+    throw new Error(invalidPathMessage);
+  }
+
+  const root = path.resolve(worktreeRoot);
+  const resolved = path.resolve(root, fixturesPathInput);
+  if (!isPathWithin(root, resolved)) throw new Error(invalidPathMessage);
+
+  try {
+    const realRoot = fs.realpathSync(root);
+    let current = root;
+    for (const segment of path.relative(root, resolved).split(path.sep)) {
+      if (!segment) continue;
+      current = path.join(current, segment);
+      let currentStats: fs.Stats;
+      try {
+        currentStats = fs.lstatSync(current);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+        throw error;
+      }
+      if (
+        currentStats.isSymbolicLink() &&
+        !isPathWithin(realRoot, fs.realpathSync(current))
+      ) {
+        throw new Error(invalidPathMessage);
+      }
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === invalidPathMessage)
+      throw error;
+    throw new Error(`${invalidPathMessage}: could not verify symlink targets`);
+  }
+  return resolved;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -339,8 +397,15 @@ async function run(): Promise<void> {
     await assertRpcHealthy(rpcUrl);
 
     // 2. Resolve paths from the HEAD workspace (fixtures, config live there)
-    const headFixturesPath = path.resolve(headWorkspace, fixturesPathRel);
-    const fixtureId = path.relative(headWorkspace, headFixturesPath);
+    const headFixturesPath = resolveRevisionFixturesPath(
+      headWorkspace,
+      fixturesPathRel,
+      "HEAD",
+    );
+    const fixtureId = path
+      .relative(path.resolve(headWorkspace), headFixturesPath)
+      .split(path.sep)
+      .join("/");
     const policy = await loadPolicy(
       headWorkspace,
       configPathRel,
@@ -402,7 +467,11 @@ async function run(): Promise<void> {
       baseSha = checkout.sha;
 
       // The fixtures file in the base worktree — same relative path
-      const baseFixturesPath = path.resolve(baseDir, fixturesPathRel);
+      const baseFixturesPath = resolveRevisionFixturesPath(
+        baseDir,
+        fixturesPathRel,
+        "BASE",
+      );
       if (!fs.existsSync(baseFixturesPath)) {
         throw new Error("fixtures-path not found in base ref");
       } else {

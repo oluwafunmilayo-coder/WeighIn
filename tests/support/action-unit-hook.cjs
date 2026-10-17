@@ -7,12 +7,13 @@ const load = Module._load;
 const mode = process.env.WEIGHIN_UNIT_MODE;
 const logDir = process.env.WEIGHIN_UNIT_LOG_DIR;
 if (logDir) fs.mkdirSync(logDir, { recursive: true });
-function logKeyPath(filePath) {
+function logKeyPath(filePath, fixtureId) {
   if (!filePath || !logDir) return;
   const dir = path.dirname(filePath);
   const stats = fs.existsSync(dir) ? fs.statSync(dir) : null;
   const record = {
     filePath,
+    fixtureId,
     dirPath: dir,
     dirMode: stats ? stats.mode & 0o777 : null,
     exists: fs.existsSync(filePath),
@@ -74,6 +75,11 @@ Module._load = function (name, parent, ...args) {
           if (command === "git" && argv[1] === "remove")
             fs.rmSync(argv.at(-1), { recursive: true, force: true });
           if (command === "stellar" && argv[0] === "contract") {
+            if (logDir)
+              fs.appendFileSync(
+                path.join(logDir, "builds.jsonl"),
+                `${JSON.stringify({ revision: isBase ? "BASE" : "HEAD", cwd: options.cwd })}\n`,
+              );
             if (isBase && mode === "build")
               throw new Error("unit base build failure");
             fs.writeFileSync(
@@ -106,7 +112,7 @@ Module._load = function (name, parent, ...args) {
     if (name === "./measurement" && mode !== "funding-exhausted")
       return {
         runMeasurement: async (options) => {
-          logKeyPath(options.keyFile);
+          logKeyPath(options.keyFile, options.fixtureId);
           const isBase = !options.fixturesPath.startsWith(
             process.env.GITHUB_WORKSPACE + path.sep,
           );

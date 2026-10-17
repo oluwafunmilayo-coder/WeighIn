@@ -55020,6 +55020,42 @@ Start the network before invoking this action (e.g. via stellar/quickstart or sc
     throw err;
   }
 }
+function isPathWithin(root, candidate) {
+  const relative3 = path6.relative(root, candidate);
+  return relative3 === "" || relative3 !== ".." && !relative3.startsWith(`..${path6.sep}`) && !path6.isAbsolute(relative3);
+}
+function resolveRevisionFixturesPath(worktreeRoot, fixturesPathInput, revision) {
+  const invalidPathMessage = `fixtures-path for ${revision} must be a relative path inside the ${revision} worktree`;
+  if (!fixturesPathInput.trim() || path6.isAbsolute(fixturesPathInput) || path6.win32.isAbsolute(fixturesPathInput) || /^[A-Za-z]:/.test(fixturesPathInput)) {
+    throw new Error(invalidPathMessage);
+  }
+  const root = path6.resolve(worktreeRoot);
+  const resolved = path6.resolve(root, fixturesPathInput);
+  if (!isPathWithin(root, resolved)) throw new Error(invalidPathMessage);
+  try {
+    const realRoot = fs5.realpathSync(root);
+    let current = root;
+    for (const segment of path6.relative(root, resolved).split(path6.sep)) {
+      if (!segment) continue;
+      current = path6.join(current, segment);
+      let currentStats;
+      try {
+        currentStats = fs5.lstatSync(current);
+      } catch (error2) {
+        if (error2.code === "ENOENT") break;
+        throw error2;
+      }
+      if (currentStats.isSymbolicLink() && !isPathWithin(realRoot, fs5.realpathSync(current))) {
+        throw new Error(invalidPathMessage);
+      }
+    }
+  } catch (error2) {
+    if (error2 instanceof Error && error2.message === invalidPathMessage)
+      throw error2;
+    throw new Error(`${invalidPathMessage}: could not verify symlink targets`);
+  }
+  return resolved;
+}
 async function capture(cmd, args, cwd) {
   let out = "";
   await exec5.exec(cmd, args, {
@@ -55203,8 +55239,12 @@ async function run() {
     core3.info(`Fixtures:   ${fixturesPathRel}`);
     core3.info(`Key file:   ${sharedKeyFile}`);
     await assertRpcHealthy(rpcUrl);
-    const headFixturesPath = path6.resolve(headWorkspace, fixturesPathRel);
-    const fixtureId = path6.relative(headWorkspace, headFixturesPath);
+    const headFixturesPath = resolveRevisionFixturesPath(
+      headWorkspace,
+      fixturesPathRel,
+      "HEAD"
+    );
+    const fixtureId = path6.relative(path6.resolve(headWorkspace), headFixturesPath).split(path6.sep).join("/");
     const policy = await loadPolicy(
       headWorkspace,
       configPathRel,
@@ -55255,7 +55295,11 @@ async function run() {
       const checkout = await checkoutRef(headWorkspace, baseRef, "base");
       baseDir = checkout.dir;
       baseSha = checkout.sha;
-      const baseFixturesPath = path6.resolve(baseDir, fixturesPathRel);
+      const baseFixturesPath = resolveRevisionFixturesPath(
+        baseDir,
+        fixturesPathRel,
+        "BASE"
+      );
       if (!fs5.existsSync(baseFixturesPath)) {
         throw new Error("fixtures-path not found in base ref");
       } else {
